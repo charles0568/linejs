@@ -27,6 +27,11 @@ export class RequestClient {
 	userAgent: string;
 	#legyTransport?: LegyEncryptedTransport;
 	/**
+	 * In "auto" mode, the time until which the encrypted gateway is skipped
+	 * after it rejected a request (see {@link isLegyGatewayRejection}).
+	 */
+	#legyRejectedUntil = 0;
+	/**
 	 * x-line-application
 	 */
 	systemType: string;
@@ -150,13 +155,33 @@ export class RequestClient {
 			// @ts-expect-error: will fix cuz typescript version change
 			body: Trequest,
 		});
-		const response = this.shouldUseLegyEncryptedRequest(path, headers)
-			? await this.legyTransport.fetch(request, this.client.fetch, {
-					application: this.systemType,
-					userAgent: this.userAgent,
-					endpoint: this.client.legy.endpoint,
-				})
-			: await this.client.fetch(request);
+		let response: Response;
+		if (this.shouldUseLegyEncryptedRequest(path, headers)) {
+			response = await this.legyTransport.fetch(request, this.client.fetch, {
+				application: this.systemType,
+				userAgent: this.userAgent,
+				endpoint: this.client.legy.endpoint,
+			});
+			// The encrypted gateway (/enc) can reject every request with an empty
+			// 404 while the plain path keeps working (#280). In "auto" mode, send
+			// the same request over the plain path instead of failing, and skip
+			// /enc for a while so each call does not pay for a rejected round trip.
+			if (this.client.legy.encrypted === "auto" && (await isLegyGatewayRejection(response))) {
+				this.#legyRejectedUntil = Date.now() + LEGY_REJECTION_BACKOFF_MS;
+				this.client.log("legyFallback", { path, methodName, until: this.#legyRejectedUntil });
+				response = await this.client.fetch(
+					new Request(`https://${this.endpoint}${path}`, {
+						method: overrideMethod,
+						headers,
+						signal: AbortSignal.timeout(timeout),
+						// @ts-expect-error: will fix cuz typescript version change
+						body: Trequest,
+					}),
+				);
+			}
+		} else {
+			response = await this.client.fetch(request);
+		}
 		const nextToken = response.headers.get("x-line-next-access");
 		if (nextToken) {
 			this.client.emit("update:authtoken", nextToken);
@@ -289,8 +314,22 @@ export class RequestClient {
 		if (mode === false) return false;
 		if (!headers["x-line-access"]) return false;
 		if (mode === true) return true;
+		if (Date.now() < this.#legyRejectedUntil) return false;
 		return isLegyTalkPath(path) && shouldUseLegyEncryptedAccess(headers["x-line-access"]);
 	}
+}
+
+const LEGY_REJECTION_BACKOFF_MS = 10 * 60 * 1000;
+
+/**
+ * An empty-body 404 from `server: legy` on /enc means the gateway refused the
+ * encrypted request before it reached the service (#280). A real Thrift
+ * response always carries a body, so this cannot be confused with an API error.
+ */
+export async function isLegyGatewayRejection(response: Response): Promise<boolean> {
+	if (response.status !== 404) return false;
+	if ((response.headers.get("server") ?? "").toLowerCase() !== "legy") return false;
+	return (await response.clone().arrayBuffer()).byteLength === 0;
 }
 
 function isLegyTalkPath(path: string): boolean {
